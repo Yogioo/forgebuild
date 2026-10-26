@@ -85,7 +85,7 @@
     this.grid = new Uint8Array(COLS * ROWS);
     this.machKind = new Array(COLS * ROWS).fill(null);
     this.ores = [];
-    this.oreQueue = 0;
+    this.oreQueue = [];        // 每颗矿带着"它该落哪一列"
     this.spawnTimer = 0;
     this.selected = "quench";
     this.placedCount = 0;
@@ -105,9 +105,14 @@
     this.floats = [];
     this.motes = [];
     this.fireT = 0;
+    this.aiming = false;
+    this.aimX = 0; this.aimY = 0;
+    this.shots = 0; this.hits = 0;
     this.wave = 1; this.waveT = 0;
     this.kills = 0; this.leaks = 0;
     this.oreTotal = 0;
+    this.oreLog = [];      // 每颗矿落在第几列（调试/遥测用）
+    this.hitXLog = [];     // 每次命中的 x 坐标
     this.spawnT = 0;
     this.dead = false;
     this.gameOverT = 0;
@@ -169,16 +174,28 @@
     return w;
   };
 
-  Game.prototype.spawnEnemy = function () {
+  Game.prototype.spawnEnemy = function (kind) {
     var hp = 20 * Math.pow(1.36, this.wave - 1);
+    var ranged = kind === "slinger" || (kind === undefined && this.wave >= 1 && Math.random() < 0.26);
+    if (ranged) {
+      // 投石怪：停在远处扔石头砸城墙，血薄但必须优先杀
+      this.enemies.push({
+        x: W + 20, y: 90 + Math.random() * (BATTLE_H - 180),
+        hp: hp * 0.62, maxHp: hp * 0.62,
+        r: 12, spd: 34 + this.wave * 0.6,
+        slowT: 0, hitT: 0, dmg: 0,
+        kind: "slinger", stopX: 180 + Math.random() * 70,   // 站得更近：20 秒内城墙就开始掉血
+        throwT: 1.6 + Math.random(), throwing: 0
+      });
+      return;
+    }
     this.enemies.push({
       x: W + 30 + Math.random() * 50,
       y: 80 + Math.random() * (BATTLE_H - 160),
       hp: hp, maxHp: hp,
       r: 10 + Math.random() * 4,
       spd: 13 + Math.random() * 9 + this.wave * 0.5,
-      slowT: 0, hitT: 0,
-      dmg: 3 + this.wave * 1.45
+      slowT: 0, hitT: 0, dmg: 3 + this.wave * 1.45, kind: "walker"
     });
   };
 
@@ -205,7 +222,40 @@
     });
   };
 
-  Game.prototype.damage = function (e, amount, depth) {
+  /* 玩家点/拖到某点 → 朝那点射（重力下要自己算提前量） */
+  Game.prototype.fireAt = function (tx, ty) {
+    if (this.dead) return false;
+    if (this.fireT > 0) return false;
+    var w = this.weapon();
+    // 速射模块 + 局外弓术精进 必须真的影响冷却（之前这里写死 0.26，等于速射无效）
+    this.fireT = 0.26 / (w.rateMul * (this.rateBonus || 1));
+    var n = w.shots;
+    for (var s = 0; s < n; s++) {
+      var spread = (s - (n - 1) / 2) * 16;
+      this.shootAt(tx, ty + spread, (14 + this.wave * 1.1) * (this.powerMul || 1), w.pierce);
+    }
+    this.shots += n;
+    return true;
+  };
+
+  /* 抛物线预览点（让玩家看得见箭会走哪） */
+  Game.prototype.previewPath = function (tx, ty) {
+    var gAcc = 900;
+    var T = Math.max(0.32, Math.min(0.72, Math.hypot(tx - this.archerX, ty - this.archerY) / 520));
+    var vx = (tx - this.archerX) / T;
+    var vy = (ty - this.archerY - 0.5 * gAcc * T * T) / T;
+    var pts = [], x = this.archerX + 6, y = this.archerY - 6, dt = 0.04;
+    for (var i = 0; i < 18; i++) {
+      y += vy * dt + 0.5 * gAcc * dt * dt;
+      vy += gAcc * dt;
+      x += vx * dt;
+      pts.push([x, y]);
+      if (x < -10 || x > W + 20 || y > BATTLE_H) break;
+    }
+    return pts;
+  };
+
+  Game.prototype.damage = function (e, amount, depth, srcX) {
     if (e.hp <= 0) return;
     e.hp -= amount;
     e.hitT = 0.12;
@@ -220,9 +270,15 @@
     if (w.slow > 0) e.slowT = 1.4;
     if (e.hp <= 0) {
       this.kills++;
-      this.oreQueue++;
+      this.hits++;
       this.oreTotal++;
-      this.motes.push({ x: e.x, y: e.y, t: 0, sx: e.x, sy: e.y });
+      // 关键改动：矿落在"这一箭命中的位置"对应的那一列，而不是怪死在的位置。
+      // 否则怪几乎都在最右列被秒杀，产线只有最右一列是活的。
+      var srcPos = (typeof srcX === "number") ? srcX : e.x;
+      var col = Math.max(0, Math.min(COLS - 1, Math.floor(srcPos / W * COLS)));
+      this.oreQueue.push(col);
+      if (this.oreLog.length < 4000) this.oreLog.push(col);
+      this.motes.push({ x: e.x, y: e.y, t: 0, sx: e.x, sy: e.y, col: col });
       this.burst(e.x, e.y, 7, "#ffd24a");
       this.floats.push({ x: e.x, y: e.y - 8, txt: "+1矿", col: "#ffd24a", life: 0.8, max: 0.8 });
     }
@@ -246,10 +302,10 @@
 
   Game.prototype.feedOre = function (dt) {
     this.spawnTimer -= dt;
-    if (this.spawnTimer <= 0 && this.oreQueue > 0) {
+    if (this.spawnTimer <= 0 && this.oreQueue.length > 0) {
       this.spawnTimer = 0.34;
-      this.oreQueue--;
-      this.ores.push({ gx: Math.floor(Math.random() * COLS), gy: -1, tag: null, vy: 0, acc: 0 });
+      var col2 = this.oreQueue.shift();
+      this.ores.push({ gx: col2, gy: -1, tag: null, vy: 0, acc: 0 });
     }
     for (var i = this.ores.length - 1; i >= 0; i--) {
       var o = this.ores[i];
@@ -310,6 +366,30 @@
       if (e.slowT > 0) e.slowT -= dt;
       e.x -= sp * dt;
 
+      // 投石怪：停住 → 蓄力 → 砸墙
+      if (e.kind === "slinger") {
+        if (e.x > e.stopX) { /* 继续前进 */ }
+        else {
+          e.spd = 0;
+          e.throwT -= dt;
+          if (e.throwT < 0.45) e.throwing = 1;
+          if (e.throwT <= 0) {
+            e.throwT = 2.6;
+            e.throwing = 0;
+            var dmg2 = 7 + this.wave * 1.5;
+            this.baseHp -= dmg2;
+            this.burst(BASE_X + 20, e.y, 10, "#ff8a4c");
+            this.floats.push({ x: BASE_X + 34, y: e.y, txt: "-" + Math.round(dmg2), col: "#ff8a4c", life: 0.9, max: 0.9 });
+            if (this.baseHp <= 0) {
+              this.baseHp = 0; this.dead = true;
+              this.best.wave = Math.max(this.best.wave, this.wave);
+              this.best.kills = Math.max(this.best.kills, this.kills);
+              this.awardPoints();
+            }
+          }
+        }
+      }
+
       if (e.x < BASE_X + 34) {
         this.baseHp -= e.dmg;
         this.leaks++;
@@ -327,18 +407,7 @@
       if (e.hp <= 0) this.enemies.splice(i, 1);
     }
 
-    this.fireT -= dt;
-    if (this.fireT <= 0) {
-      var tg = this.nearest(this.archerX, this.archerY);
-      if (tg) {
-        this.fireT = 0.55 / (w.rateMul * (this.rateBonus || 1));
-        var n = w.shots;
-        for (var s = 0; s < n; s++) {
-          var spread = (s - (n - 1) / 2) * 18;
-          this.shootAt(tg.x, tg.y + spread, (14 + this.wave * 1.1) * (this.powerMul || 1), w.pierce);
-        }
-      }
-    }
+    this.fireT -= dt;      // 只做冷却计时，不再自动开火
 
     var g = 900;
     for (var a = this.arrows.length - 1; a >= 0; a--) {
@@ -352,6 +421,17 @@
       if (ar.trail.length > 7) ar.trail.shift();
 
       if (ar.life <= 0 || ar.x < -20 || ar.x > W + 40 || ar.y > BATTLE_H - 6) {
+        // 落点溅射：半径 20，60% 伤害。射偏了也给反馈，但正中更划算
+        var hitAny = false;
+        for (var si = 0; si < this.enemies.length; si++) {
+          var se = this.enemies[si];
+          if (se.hp <= 0) continue;
+          if (Math.hypot(se.x - ar.x, se.y - ar.y) < 20 + se.r) {
+            this.damage(se, ar.dmg * 0.6, 1, ar.x);
+            hitAny = true;
+          }
+        }
+        if (hitAny) this.burst(ar.x, ar.y, 5, "#ffcf7a");
         this.arrows.splice(a, 1);
         continue;
       }
@@ -360,7 +440,8 @@
         var en = this.enemies[k];
         if (en.hp <= 0 || ar.hitSet.indexOf(en) >= 0) continue;
         if (Math.hypot(en.x - ar.x, en.y - ar.y) < en.r + 5) {
-          this.damage(en, ar.dmg, 0);
+          if (this.hitXLog.length < 4000) this.hitXLog.push(Math.round(ar.x));
+          this.damage(en, ar.dmg, 0, ar.x);
           ar.hitSet.push(en);
           this.burst(ar.x, ar.y, 4, "#ffe9a8");
           if (ar.pierceLeft > 0) ar.pierceLeft--;
@@ -401,12 +482,12 @@
     this.t = 0;
     this.grid = new Uint8Array(COLS * ROWS);
     this.machKind = new Array(COLS * ROWS).fill(null);
-    this.ores = []; this.oreQueue = 0; this.spawnTimer = 0; this.placedCount = 0;
+    this.ores = []; this.oreQueue = []; this.spawnTimer = 0; this.placedCount = 0;
     for (var k in MOD) this.mods[k] = { lv: 0, xp: 0 };
     this.slots = ["double", "pierce", "rapid"];
     this.applyMeta();          // 局外升级在每局开始时生效
     this.enemies = []; this.arrows = []; this.parts = []; this.floats = []; this.motes = [];
-    this.fireT = 0; this.wave = 1; this.waveT = 0;
+    this.fireT = 0; this.aiming = false; this.shots = 0; this.hits = 0; this.wave = 1; this.waveT = 0;
     this.kills = 0; this.leaks = 0; this.spawnT = 0; this.oreTotal = 0;
     this.dead = false; this.gameOverT = 0;
   };
@@ -520,7 +601,13 @@
     g.fillText("WAVE " + this.wave, W - 12, 20);
     g.fillStyle = "rgba(190,215,240,0.8)";
     g.font = "600 11px -apple-system,Segoe UI,Roboto,sans-serif";
-    g.fillText("击杀 " + this.kills + " · 漏 " + this.leaks + " · 累计矿 " + (this.oreTotal || 0), W - 12, 38);
+    g.fillText("击杀 " + this.kills + " · 漏 " + this.leaks + " · 累计矿 " + (this.oreTotal || 0) + " · 待投 " + this.oreQueue.length, W - 12, 38);
+    if (this.t < 8) {
+      g.textAlign = "left";
+      g.fillStyle = "rgba(255,235,180," + (0.55 + Math.sin(this.t * 4) * 0.25) + ")";
+      g.font = "800 12px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText("按住并拖动 → 松手射箭（箭会下坠，要算提前量）", 12, BATTLE_H - 12);
+    }
 
     // 弓箭手：分段剪影，只有持弓的手臂朝向目标
     var ax = this.archerX, ay = this.archerY;
@@ -599,10 +686,25 @@
     g.lineWidth = 1;
     g.strokeRect(0.5, wallTop + 0.5, 67, BATTLE_H - wallTop - 1);
 
+    // 瞄准轨迹预览
+    if (this.aiming) {
+      var pts = this.previewPath(this.aimX, this.aimY);
+      for (var pi = 0; pi < pts.length; pi++) {
+        var a2 = 1 - pi / pts.length;
+        g.fillStyle = "rgba(255,225,150," + (0.55 * a2) + ")";
+        g.beginPath(); g.arc(pts[pi][0], pts[pi][1], 2.2, 0, 6.283); g.fill();
+      }
+      g.strokeStyle = "rgba(255,210,120,0.5)";
+      g.lineWidth = 1;
+      g.beginPath(); g.arc(this.aimX, this.aimY, 9, 0, 6.283); g.stroke();
+      g.beginPath(); g.moveTo(this.aimX - 13, this.aimY); g.lineTo(this.aimX - 5, this.aimY);
+      g.moveTo(this.aimX + 5, this.aimY); g.lineTo(this.aimX + 13, this.aimY); g.stroke();
+    }
+
     // 敌人
     for (var i = 0; i < this.enemies.length; i++) {
       var e = this.enemies[i];
-      var col = e.hitT > 0 ? "#ffffff" : (e.slowT > 0 ? "#7fe3d8" : "#e8564f");
+      var col = e.hitT > 0 ? "#ffffff" : (e.slowT > 0 ? "#7fe3d8" : (e.kind === "slinger" ? "#ff8a4c" : "#e8564f"));
       var wob = Math.sin(this.t * 8 + e.x * 0.1) * 1.6;
       // 腿
       g.strokeStyle = "#7d2b2b"; g.lineWidth = 3; g.lineCap = "round";
@@ -620,6 +722,16 @@
       g.fillStyle = "#241014";
       g.beginPath(); g.arc(e.x - e.r * 0.38, e.y - e.r * 0.18, e.r * 0.09, 0, 6.283); g.fill();
       g.beginPath(); g.arc(e.x - e.r * 0.38, e.y + e.r * 0.26, e.r * 0.09, 0, 6.283); g.fill();
+      if (e.kind === "slinger") {
+        // 石头
+        g.fillStyle = "rgba(120,110,100,0.95)";
+        g.beginPath(); g.arc(e.x + e.r * 0.2, e.y - e.r * 0.9, e.r * 0.42, 0, 6.283); g.fill();
+        if (e.throwing) {
+          g.strokeStyle = "rgba(255,140,80," + (0.5 + Math.sin(this.t * 18) * 0.35) + ")";
+          g.lineWidth = 2;
+          g.beginPath(); g.arc(e.x, e.y, e.r + 6, 0, 6.283); g.stroke();
+        }
+      }
       // 血条
       var hw = e.r * 2.1;
       g.fillStyle = "rgba(0,0,0,0.5)";
@@ -677,7 +789,8 @@
     // 飞矿
     for (var mi = 0; mi < this.motes.length; mi++) {
       var m0 = this.motes[mi];
-      var tx0 = GRID_X + COLS * CELL / 2, ty0 = GRID_TOP - 14;
+      var tcol = (m0.col === undefined ? Math.floor(COLS / 2) : m0.col);
+      var tx0 = GRID_X + tcol * CELL + CELL / 2, ty0 = GRID_TOP - 14;
       var ex = m0.sx + (tx0 - m0.sx) * m0.t;
       var ey = m0.sy + (ty0 - m0.sy) * m0.t - Math.sin(m0.t * Math.PI) * 28;
       g.globalAlpha = 1 - m0.t * 0.4;
@@ -697,7 +810,7 @@
     g.fillText("熔炉产线", 14, BATTLE_H + 22);
     g.fillStyle = "rgba(180,205,230,0.55)";
     g.font = "600 10.5px -apple-system,Segoe UI,Roboto,sans-serif";
-    g.fillText("矿最后经过哪台机器 → 那种模块 +1 经验 → 升级 → 变强", 84, BATTLE_H + 22);
+    g.fillText("怪死在哪一列 → 矿就落那一列 → 那种模块 +1 经验", 84, BATTLE_H + 22);
 
     for (var gx0 = 0; gx0 < COLS; gx0++) {
       var laneX = GRID_X + gx0 * CELL + CELL / 2;
@@ -912,6 +1025,8 @@
     fit(canvas);
     root.addEventListener("resize", function () { fit(canvas); });
     canvas.addEventListener("pointerdown", onDown);
+    root.addEventListener("pointermove", onMove);
+    root.addEventListener("pointerup", onUp);
     last = Date.now();
     loop();
   }
@@ -969,8 +1084,29 @@
       }
     }
 
+    // 战斗区：按下即瞄准（松手射）
+    if (p.y > 50 && p.y < C.BATTLE_H && !game.aiming) {
+      game.aiming = true;
+      game.aimX = p.x; game.aimY = p.y;
+      return;
+    }
+
     var cell = game.cellAt(p.x, p.y);
     if (cell) game.placeMachine(cell.x, cell.y);
+  }
+
+  function onMove(e) {
+    if (!game.aiming) return;
+    var cv = root.document.getElementById("game");
+    var r = cv.getBoundingClientRect();
+    game.aimX = (e.clientX - r.left) / (r.width / W);
+    game.aimY = (e.clientY - r.top) / (r.height / H);
+  }
+
+  function onUp(e) {
+    if (!game.aiming) return;
+    game.fireAt(game.aimX, game.aimY);
+    game.aiming = false;
   }
 
   function loop() {
@@ -990,6 +1126,7 @@
       game.draw();
       return this.info();
     },
+    fire: function (x, y) { return game.fireAt(x, y); },
     place: function (x, y, kind) { if (kind) game.selected = kind; return game.placeMachine(x, y); },
     info: function () {
       var lv = {};
@@ -1002,7 +1139,8 @@
         ores: game.ores.length, queue: game.oreQueue,
         machines: game.placedCount, arrows: game.arrows.length, enemies: game.enemies.length,
         points: Math.floor(game.meta.points), metaUp: game.meta.up, maxMachines: game.maxMachines,
-        maxHp: game.baseMaxHp, powerMul: game.powerMul
+        maxHp: game.baseMaxHp, powerMul: game.powerMul,
+        shots: game.shots, hits: game.hits, oreLog: game.oreLog.length, aiming: game.aiming
       };
     }
   };
