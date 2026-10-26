@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0b0810">
+<title>熔炉产线 · ForgeBuild</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#08070c;overflow:hidden;
+    -webkit-tap-highlight-color:transparent;touch-action:none;
+    font-family:-apple-system,"Segoe UI","Microsoft YaHei",Roboto,sans-serif}
+  #stage{display:flex;align-items:center;justify-content:center;height:100%}
+  #game{display:block;touch-action:none}
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="game" width="420" height="740"></canvas></div>
+<script>
+/* ==== src/game.js ==== */
+/* ==========================================================================
+   ForgeBuild Prototype v0.1
+   上面：自动战斗，怪从右边走来，击杀掉矿
+   下面：5×4 产线格，矿从上落下穿过机器，最后经过的机器决定产出哪种模块
+   机制：模块 = 行为改造（双发/穿透/爆裂/霜缚/速射），插槽有限
+   ========================================================================== */
+(function (root) {
+  "use strict";
+
+  var W = 420, H = 740;
+  var BATTLE_H = 330;
+  var GRID_TOP = 372;
+  var CELL = 40, COLS = 5, ROWS = 4;
+  var GRID_X = 14;
+  var PANEL_X = 232;
+  var BAR_H = 96;
+
+  /* 机器 → 产出的模块（最后经过的机器决定） */
+  var MACHINES = {
+    quench:  { nm: "淬火", mod: "double", col: "#ff9a5c" },
+    grind:   { nm: "研磨", mod: "pierce", col: "#5cc8ff" },
+    enchant: { nm: "附魔", mod: "aoe",    col: "#c58bff" },
+    chill:   { nm: "霜缚", mod: "slow",   col: "#7fe3d8" },
+    boost:   { nm: "加速", mod: "rapid",  col: "#ffd24a" }
+  };
+  var MOD_INFO = {
+    double: { nm: "双发", col: "#ff9a5c" },
+    pierce: { nm: "穿透", col: "#5cc8ff" },
+    aoe:    { nm: "爆裂", col: "#c58bff" },
+    slow:   { nm: "霜缚", col: "#7fe3d8" },
+    rapid:  { nm: "速射", col: "#ffd24a" }
+  };
+
+  var EMPTY = 0, SAND = 1, MACH = 2, WALL = 3;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function fmt(n) {
+    if (n < 1000) return Math.round(n).toString();
+    var u = ["K", "M", "B"], i = -1;
+    while (n >= 1000 && i < 2) { n /= 1000; i++; }
+    return (Math.round(n * 10) / 10) + u[i];
+  }
+
+  function Game(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext("2d");
+    this.t = 0;
+
+    /* --- 产线 --- */
+    this.grid = new Uint8Array(COLS * ROWS);
+    this.machKind = new Array(COLS * ROWS).fill(null);
+    this.ores = [];                 // {gx, gy, tag, vy}
+    this.oreQueue = 0;              // 击杀积攒的矿
+    this.spawnTimer = 0;
+    this.selected = "quench";
+    this.placedCount = 0;
+    this.maxMachines = 5;
+    this.modules = [];              // 已产出待装备
+    this.equipped = [null, null, null];
+
+    /* --- 战斗 --- */
+    this.px = 54; this.py = 200;
+    this.enemies = [];
+    this.bullets = [];
+    this.parts = [];
+    this.fireT = 0;
+    this.wave = 1;
+    this.waveT = 0;
+    this.kills = 0;
+    this.leaks = 0;
+    this.dmgDealt = 0;
+    this.spawnEnemyT = 0;
+    this.motes = [];                // 从怪物飞向产线的矿粒（表现层）
+    this.floats = [];
+
+    this.baseDmg = 9;
+    this.baseRate = 0.62;
+  }
+
+  /* ---------------- 战斗 ---------------- */
+  Game.prototype.spawnEnemy = function () {
+    var hp = 26 * Math.pow(1.34, this.wave - 1);
+    this.enemies.push({
+      x: W + 40 + Math.random() * 60,
+      y: 70 + Math.random() * (BATTLE_H - 150),
+      hp: hp, maxHp: hp,
+      r: 11 + Math.random() * 4,
+      spd: 16 + Math.random() * 12 + this.wave * 0.6,
+      slowT: 0, hitT: 0
+    });
+  };
+
+  Game.prototype.weaponStats = function () {
+    var s = {
+      shots: 1, dmgMul: 1, pierce: 0, aoe: 0, aoeMul: 0, slow: 0, rateMul: 1,
+      has: function (m) { return this.equipped.indexOf(m) >= 0; }
+    };
+    var eq = this.equipped;
+    s.equipped = eq.slice();
+    if (eq.indexOf("double") >= 0) { s.shots = 2; s.dmgMul *= 0.55; }
+    if (eq.indexOf("pierce") >= 0) { s.pierce = 2; s.dmgMul *= 0.85; }
+    if (eq.indexOf("aoe") >= 0) { s.aoe = 40; s.aoeMul = 0.4; }
+    if (eq.indexOf("slow") >= 0) { s.slow = 0.45; }
+    if (eq.indexOf("rapid") >= 0) { s.rateMul *= 1.5; s.dmgMul *= 0.85; }
+    return s;
+  };
+
+  Game.prototype.nearestEnemy = function (x, y, skip) {
+    var best = null, bd = 1e9;
+    for (var i = 0; i < this.enemies.length; i++) {
+      var e = this.enemies[i];
+      if (e.hp <= 0) continue;
+      if (skip && skip.indexOf(e) >= 0) continue;
+      var d = (e.x - x) * (e.x - x) + (e.y - y) * (e.y - y);
+      if (d < bd) { bd = d; best = e; }
+    }
+    return best;
+  };
+
+  Game.prototype.hitEnemy = function (e, amount, ignoreArmor, depth) {
+    if (e.hp <= 0) return;
+    e.hp -= amount;
+    e.hitT = 0.12;
+    this.dmgDealt += amount;
+    var st = this.weaponStats();
+
+    if (st.aoe > 0 && depth === 0) {
+      for (var i = 0; i < this.enemies.length; i++) {
+        var o = this.enemies[i];
+        if (o === e || o.hp <= 0) continue;
+        var dx = o.x - e.x, dy = o.y - e.y;
+        if (dx * dx + dy * dy < st.aoe * st.aoe) this.hitEnemy(o, amount * st.aoeMul, true, 1);
+      }
+    }
+    if (st.slow > 0) e.slowT = 1.6;
+
+    if (e.hp <= 0) {
+      this.kills++;
+      this.oreQueue += 1;
+      this.motes.push({ x: e.x, y: e.y, t: 0, sx: e.x, sy: e.y });
+      this.burst(e.x, e.y, 8, "#ffd24a");
+      this.floats.push({ x: e.x, y: e.y, txt: "+1矿", life: 0.9, max: 0.9, col: "#ffd24a" });
+    }
+  };
+
+  /* ---------------- 产线 ---------------- */
+  Game.prototype.gridIdx = function (x, y) { return y * COLS + x; };
+  Game.prototype.cellAt = function (px, py) {
+    var gx = Math.floor((px - GRID_X) / CELL);
+    var gy = Math.floor((py - GRID_TOP) / CELL);
+    if (gx < 0 || gx >= COLS || gy < 0 || gy >= ROWS) return null;
+    return { x: gx, y: gy };
+  };
+
+  Game.prototype.placeMachine = function (gx, gy) {
+    var i = this.gridIdx(gx, gy);
+    if (this.grid[i] === MACH) {          // 点击已有机器 → 移除
+      this.grid[i] = EMPTY; this.machKind[i] = null; this.placedCount--;
+      return "removed";
+    }
+    if (this.grid[i] !== EMPTY) return false;
+    if (this.placedCount >= this.maxMachines) return false;
+    this.grid[i] = MACH;
+    this.machKind[i] = this.selected;
+    this.placedCount++;
+    return "placed";
+  };
+
+  Game.prototype.feedOre = function (dt) {
+    // 击杀产出的矿，按节奏投进产线
+    this.spawnTimer -= dt;
+    if (this.spawnTimer <= 0 && this.oreQueue > 0) {
+      this.spawnTimer = 0.55;
+      this.oreQueue--;
+      this.ores.push({ gx: Math.floor(Math.random() * COLS), gy: -1, tag: null, vy: 0 });
+    }
+
+    for (var i = this.ores.length - 1; i >= 0; i--) {
+      var o = this.ores[i];
+      o.vy = Math.min(o.vy + dt * 7, 3.2);
+      o.acc = (o.acc || 0) + o.vy * dt * 3;
+      while (o.acc >= 1) {
+        o.acc -= 1;
+        var nx = o.gx, ny = o.gy + 1;
+        if (ny >= ROWS) {                     // 掉出底部 → 产出模块
+          this.produce(o.tag);
+          this.ores.splice(i, 1);
+          break;
+        }
+        var ci = this.gridIdx(nx, ny);
+        if (this.grid[ci] === MACH) {
+          o.tag = MACHINES[this.machKind[ci]].mod;   // 最后经过的机器决定
+        } else if (this.grid[ci] === WALL) {
+          // 撞墙 → 斜滑
+          var d = Math.random() < 0.5 ? -1 : 1;
+          var sx = nx + d;
+          if (sx >= 0 && sx < COLS) {
+            var si = this.gridIdx(sx, ny);
+            if (this.grid[si] !== WALL) { o.gx = sx; ny = o.gy + 1; }
+          }
+          this.ores.splice(i, 1);             // 简化：滑不动就消失（废料）
+          break;
+        }
+        o.gy = ny;
+      }
+    }
+  };
+
+  Game.prototype.produce = function (tag) {
+    if (!tag) { this.floats.push({ x: 120, y: GRID_TOP + ROWS * CELL + 10, txt: "废料", life: 0.8, max: 0.8, col: "#8b97a5" }); return; }
+    this.modules.push(tag);
+    // 自动装备到空槽，但不重复装同名模块（叠同款没有额外收益，会浪费槽位）
+    var mod = this.modules.pop();
+    if (this.equipped.indexOf(mod) < 0) {
+      for (var i = 0; i < this.equipped.length; i++) {
+        if (!this.equipped[i]) { this.equipped[i] = mod; return; }
+      }
+    }
+    this.modules.push(mod);
+    if (this.modules.length > 6) this.modules.shift();
+  };
+
+  /* ---------------- 每帧 ---------------- */
+  Game.prototype.update = function (dt) {
+    this.t += dt;
+    var st = this.weaponStats();
+
+    /* 波次 */
+    this.waveT += dt;
+    if (this.waveT > 26) { this.waveT = 0; this.wave++; }
+
+    /* 出怪 */
+    this.spawnEnemyT -= dt;
+    if (this.spawnEnemyT <= 0) {
+      this.spawnEnemyT = Math.max(0.45, 1.5 - this.wave * 0.08);
+      this.spawnEnemy();
+    }
+
+    /* 敌人 */
+    for (var i = this.enemies.length - 1; i >= 0; i--) {
+      var e = this.enemies[i];
+      e.hitT = Math.max(0, e.hitT - dt);
+      var sp = e.spd * (e.slowT > 0 ? (1 - st.slow) : 1);
+      if (e.slowT > 0) e.slowT -= dt;
+      e.x -= sp * dt;
+      if (e.x < 70) {                        // 漏怪
+        this.leaks++;
+        this.burst(e.x, e.y, 10, "#ff5c6e");
+        this.enemies.splice(i, 1);
+        continue;
+      }
+      if (e.hp <= 0) { this.enemies.splice(i, 1); continue; }
+    }
+
+    /* 开火 */
+    this.fireT -= dt;
+    if (this.fireT <= 0) {
+      var tg = this.nearestEnemy(this.px, this.py);
+      if (tg) {
+        this.fireT = this.baseRate / st.rateMul;
+        for (var s = 0; s < st.shots; s++) {
+          this.bullets.push({
+            x: this.px + 14, y: this.py + (s - (st.shots - 1) / 2) * 14,
+            tx: tg.x, ty: tg.y, tg: tg,
+            dmg: this.baseDmg * st.dmgMul, pierceLeft: st.pierce, hit: 0, life: 2.4
+          });
+        }
+      }
+    }
+
+    /* 子弹 */
+    for (var b = this.bullets.length - 1; b >= 0; b--) {
+      var bu = this.bullets[b];
+      bu.life -= dt;
+      if (bu.life <= 0 || !bu.tg || bu.tg.hp <= 0) {
+        if (!bu.tg || bu.tg.hp <= 0) bu.tg = this.nearestEnemy(bu.x, bu.y);
+        if (!bu.tg) { this.bullets.splice(b, 1); continue; }
+        bu.tx = bu.tg.x; bu.ty = bu.tg.y;
+      }
+      var dx = bu.tx - bu.x, dy = bu.ty - bu.y;
+      var d = Math.hypot(dx, dy);
+      var mv = 560 * dt;
+      if (d <= mv + bu.tg.r) {
+        this.hitEnemy(bu.tg, bu.dmg * (bu.hit === 0 ? 1 : 0.7), bu.pierceLeft > 0, 0);
+        bu.hit++;
+        if (bu.pierceLeft > 0) { bu.pierceLeft--; bu.tg = null; }
+        else this.bullets.splice(b, 1);
+      } else {
+        bu.x += dx / d * mv; bu.y += dy / d * mv;
+      }
+    }
+
+    /* 矿粒飞向产线 */
+    for (var mi = this.motes.length - 1; mi >= 0; mi--) {
+      var mo = this.motes[mi];
+      mo.t += dt * 1.5;
+      if (mo.t >= 1) this.motes.splice(mi, 1);
+    }
+
+    /* 粒子 / 飘字 */
+    for (var p = this.parts.length - 1; p >= 0; p--) {
+      var q = this.parts[p];
+      q.life -= dt; q.x += q.vx * dt; q.y += q.vy * dt; q.vy += 240 * dt;
+      if (q.life <= 0) this.parts.splice(p, 1);
+    }
+    for (var f = this.floats.length - 1; f >= 0; f--) {
+      var o2 = this.floats[f];
+      o2.life -= dt; o2.y -= dt * 34;
+      if (o2.life <= 0) this.floats.splice(f, 1);
+    }
+
+    this.feedOre(dt);
+  };
+
+  Game.prototype.burst = function (x, y, n, col) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * 6.283, s = 40 + Math.random() * 140;
+      this.parts.push({ x: x, y: y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0.4 + Math.random() * 0.4, max: 0.8, r: 1.4 + Math.random() * 2, c: col });
+    }
+  };
+
+  root.ForgeGame = { Game: Game, C: { W: W, H: H, BATTLE_H: BATTLE_H, GRID_TOP: GRID_TOP, CELL: CELL, COLS: COLS, ROWS: ROWS, GRID_X: GRID_X, PANEL_X: PANEL_X, BAR_H: BAR_H }, MACHINES: MACHINES, MOD_INFO: MOD_INFO, fmt: fmt };
+})(typeof window !== "undefined" ? window : globalThis);
+
+/* ==== src/render.js ==== */
+/* ForgeBuild · 渲染 */
+(function (root) {
+  "use strict";
+  var G = root.ForgeGame, C = G.C, fmt = G.fmt;
+  var W = C.W, H = C.H, BATTLE_H = C.BATTLE_H, GRID_TOP = C.GRID_TOP;
+  var CELL = C.CELL, COLS = C.COLS, ROWS = C.ROWS, GRID_X = C.GRID_X;
+  var PANEL_X = C.PANEL_X, BAR_H = C.BAR_H;
+
+  function rr(g, x, y, w, h, r) {
+    g.beginPath();
+    g.moveTo(x + r, y);
+    g.arcTo(x + w, y, x + w, y + h, r);
+    g.arcTo(x + w, y + h, x, y + h, r);
+    g.arcTo(x, y + h, x, y, r);
+    g.arcTo(x, y, x + w, y, r);
+    g.closePath();
+  }
+
+  G.machRects = function () {
+    var keys = Object.keys(G.MACHINES);
+    var n = keys.length, gap = 6, w = (W - 24 - gap * (n - 1)) / n;
+    return keys.map(function (k, i) {
+      return { id: k, x: 12 + i * (w + gap), y: H - BAR_H + 40, w: w, h: 46 };
+    });
+  };
+
+  G.slotRects = function () {
+    var out = [];
+    for (var i = 0; i < 3; i++) out.push({ i: i, x: PANEL_X, y: 392 + i * 46, w: 174, h: 40 });
+    return out;
+  };
+
+  G.Game.prototype.draw = function () {
+    var g = this.ctx;
+    g.clearRect(0, 0, W, H);
+
+    /* ===== 战斗区 ===== */
+    var bg = g.createLinearGradient(0, 0, 0, BATTLE_H);
+    bg.addColorStop(0, "#1a1420");
+    bg.addColorStop(0.6, "#120e16");
+    bg.addColorStop(1, "#0b0810");
+    g.fillStyle = bg;
+    g.fillRect(0, 0, W, BATTLE_H);
+
+    // 地面
+    g.fillStyle = "rgba(255,255,255,0.04)";
+    g.fillRect(0, BATTLE_H - 26, W, 26);
+
+    // HUD
+    g.textAlign = "left"; g.textBaseline = "middle";
+    g.font = "800 13px -apple-system,Segoe UI,Roboto,sans-serif";
+    g.fillStyle = "#ffd24a";
+    g.fillText("WAVE " + this.wave, 14, 18);
+    g.fillStyle = "rgba(190,215,240,0.85)";
+    g.font = "600 12px -apple-system,Segoe UI,Roboto,sans-serif";
+    g.fillText("击杀 " + this.kills + " · 漏 " + this.leaks + " · 矿 " + this.oreQueue, 90, 18);
+
+    // 玩家
+    var px = this.px, py = this.py;
+    var pg = g.createRadialGradient(px, py, 2, px, py, 30);
+    pg.addColorStop(0, "rgba(120,200,255,0.55)");
+    pg.addColorStop(1, "rgba(120,200,255,0)");
+    g.fillStyle = pg;
+    g.beginPath(); g.arc(px, py, 30, 0, 6.283); g.fill();
+    g.fillStyle = "#cfeeff";
+    g.beginPath();
+    g.moveTo(px + 15, py); g.lineTo(px - 10, py - 12); g.lineTo(px - 10, py + 12);
+    g.closePath(); g.fill();
+
+    // 敌人
+    for (var i = 0; i < this.enemies.length; i++) {
+      var e = this.enemies[i];
+      var col = e.hitT > 0 ? "#ffffff" : (e.slowT > 0 ? "#7fe3d8" : "#ff6b6b");
+      g.fillStyle = col;
+      g.beginPath(); g.arc(e.x, e.y, e.r, 0, 6.283); g.fill();
+      g.fillStyle = "rgba(0,0,0,0.35)";
+      g.beginPath(); g.arc(e.x, e.y, e.r * 0.55, 0, 6.283); g.fill();
+      // 血条
+      var hw = e.r * 2.2;
+      g.fillStyle = "rgba(0,0,0,0.5)";
+      g.fillRect(e.x - hw / 2, e.y - e.r - 7, hw, 3.5);
+      g.fillStyle = "#ff9a5c";
+      g.fillRect(e.x - hw / 2, e.y - e.r - 7, hw * clamp01(e.hp / e.maxHp), 3.5);
+    }
+
+    // 子弹
+    for (var b = 0; b < this.bullets.length; b++) {
+      var bu = this.bullets[b];
+      g.fillStyle = "#ffe9a8";
+      g.beginPath(); g.arc(bu.x, bu.y, 3.4, 0, 6.283); g.fill();
+      g.fillStyle = "rgba(255,220,120,0.35)";
+      g.beginPath(); g.arc(bu.x, bu.y, 7, 0, 6.283); g.fill();
+    }
+
+    // 粒子
+    for (var p = 0; p < this.parts.length; p++) {
+      var q = this.parts[p];
+      g.globalAlpha = Math.max(0, q.life / q.max);
+      g.fillStyle = q.c;
+      g.beginPath(); g.arc(q.x, q.y, q.r, 0, 6.283); g.fill();
+    }
+    g.globalAlpha = 1;
+
+    // 飘字
+    for (var f = 0; f < this.floats.length; f++) {
+      var o = this.floats[f];
+      g.globalAlpha = Math.min(1, o.life / o.max * 1.5);
+      g.fillStyle = o.col;
+      g.font = "700 12px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.textAlign = "center";
+      g.fillText(o.txt, o.x, o.y);
+      g.globalAlpha = 1;
+    }
+
+    /* 飞向产线的矿粒 */
+    for (var moi = 0; moi < this.motes.length; moi++) {
+      var m0 = this.motes[moi];
+      var tx0 = GRID_X + COLS * CELL / 2, ty0 = GRID_TOP - 14;
+      var ex = m0.sx + (tx0 - m0.sx) * m0.t;
+      var ey = m0.sy + (ty0 - m0.sy) * m0.t - Math.sin(m0.t * Math.PI) * 30;
+      g.globalAlpha = 1 - m0.t * 0.5;
+      g.fillStyle = "rgba(255,210,90,0.35)";
+      g.beginPath(); g.arc(ex, ey, 7, 0, 6.283); g.fill();
+      g.fillStyle = "#ffd24a";
+      g.beginPath(); g.arc(ex, ey, 3.6, 0, 6.283); g.fill();
+      g.globalAlpha = 1;
+    }
+
+    /* ===== 分割 ===== */
+    g.fillStyle = "#0a090f";
+    g.fillRect(0, BATTLE_H, W, GRID_TOP - BATTLE_H);
+    g.textAlign = "left";
+    g.fillStyle = "rgba(255,190,90,0.9)";
+    g.font = "800 12px -apple-system,Segoe UI,Roboto,sans-serif";
+    g.fillText("熔炉产线", 14, BATTLE_H + 22);
+    g.fillStyle = "rgba(180,205,230,0.6)";
+    g.font = "600 11px -apple-system,Segoe UI,Roboto,sans-serif";
+    g.fillText("矿穿过哪台机器，就出哪种模块（最后经过的决定）", 90, BATTLE_H + 22);
+
+    /* 列导轨：入口 → 出口的纵向参考线 */
+    for (var gx0 = 0; gx0 < COLS; gx0++) {
+      var laneX = GRID_X + gx0 * CELL + CELL / 2;
+      g.save();
+      g.strokeStyle = "rgba(255,205,130,0.10)";
+      g.lineWidth = 1;
+      g.setLineDash([3, 4]);
+      g.beginPath();
+      g.moveTo(laneX, GRID_TOP - 8);
+      g.lineTo(laneX, GRID_TOP + ROWS * CELL + 6);
+      g.stroke();
+      g.restore();
+      // 出口箭头
+      g.fillStyle = "rgba(255,205,130,0.30)";
+      g.beginPath();
+      g.moveTo(laneX, GRID_TOP + ROWS * CELL + 10);
+      g.lineTo(laneX - 4, GRID_TOP + ROWS * CELL + 4);
+      g.lineTo(laneX + 4, GRID_TOP + ROWS * CELL + 4);
+      g.closePath(); g.fill();
+    }
+
+    /* ===== 产线格 ===== */
+    for (var y = 0; y < ROWS; y++) {
+      for (var x = 0; x < COLS; x++) {
+        var cx = GRID_X + x * CELL, cy = GRID_TOP + y * CELL;
+        var ci = y * COLS + x;
+        g.fillStyle = "rgba(255,255,255,0.03)";
+        rr(g, cx + 1.5, cy + 1.5, CELL - 3, CELL - 3, 6);
+        g.fill();
+        g.strokeStyle = "rgba(120,160,200,0.16)";
+        g.lineWidth = 1;
+        rr(g, cx + 1.5, cy + 1.5, CELL - 3, CELL - 3, 6);
+        g.stroke();
+
+        if (this.grid[ci] === 2) {
+          var mk = this.machKind[ci];
+          var mc = G.MACHINES[mk].col;
+          g.fillStyle = mc;
+          g.globalAlpha = 0.85;
+          rr(g, cx + 4, cy + 4, CELL - 8, CELL - 8, 7);
+          g.fill();
+          g.globalAlpha = 1;
+          g.fillStyle = "#12100f";
+          g.font = "800 11px -apple-system,Segoe UI,Roboto,sans-serif";
+          g.textAlign = "center"; g.textBaseline = "middle";
+          g.fillText(G.MACHINES[mk].nm, cx + CELL / 2, cy + CELL / 2 - 6);
+          g.font = "700 8.5px -apple-system,Segoe UI,Roboto,sans-serif";
+          g.fillStyle = "rgba(20,16,12,0.75)";
+          g.fillText("→" + G.MOD_INFO[G.MACHINES[mk].mod].nm, cx + CELL / 2, cy + CELL / 2 + 7);
+        }
+      }
+    }
+
+    // 矿
+    for (var oi = 0; oi < this.ores.length; oi++) {
+      var ore = this.ores[oi];
+      var ox = GRID_X + ore.gx * CELL + CELL / 2;
+      var oy = GRID_TOP + (ore.gy + 0.5) * CELL + ((ore.acc || 0) * CELL * 0.5);
+      var oc = ore.tag ? G.MOD_INFO[ore.tag].col : "#c8935a";
+      g.fillStyle = oc;
+      g.beginPath(); g.arc(ox, oy, 5, 0, 6.283); g.fill();
+      g.fillStyle = "rgba(255,255,255,0.5)";
+      g.beginPath(); g.arc(ox - 1.4, oy - 1.4, 1.8, 0, 6.283); g.fill();
+    }
+
+    // 底部出口提示
+    g.fillStyle = "rgba(255,210,120,0.35)";
+    g.fillRect(GRID_X, GRID_TOP + ROWS * CELL + 2, COLS * CELL, 2);
+
+    /* ===== 右侧：模块槽 ===== */
+    g.textAlign = "left"; g.textBaseline = "middle";
+    g.fillStyle = "rgba(200,225,245,0.75)";
+    g.font = "800 11px -apple-system,Segoe UI,Roboto,sans-serif";
+    g.fillText("武器插槽", PANEL_X, GRID_TOP + 6);
+
+    var slots = G.slotRects();
+    for (var s2 = 0; s2 < slots.length; s2++) {
+      var sl = slots[s2];
+      var mod = this.equipped[sl.i];
+      rr(g, sl.x, sl.y, sl.w, sl.h, 9);
+      if (mod) {
+        g.fillStyle = G.MOD_INFO[mod].col;
+        g.globalAlpha = 0.88;
+        g.fill();
+        g.globalAlpha = 1;
+        g.fillStyle = "#12100f";
+        g.font = "800 13px -apple-system,Segoe UI,Roboto,sans-serif";
+        g.textAlign = "center";
+        g.fillText(G.MOD_INFO[mod].nm, sl.x + sl.w / 2, sl.y + sl.h / 2);
+      } else {
+        g.fillStyle = "rgba(255,255,255,0.04)";
+        g.fill();
+        g.strokeStyle = "rgba(140,180,220,0.2)";
+        g.lineWidth = 1;
+        rr(g, sl.x, sl.y, sl.w, sl.h, 9);
+        g.stroke();
+        g.fillStyle = "rgba(180,205,230,0.35)";
+        g.font = "700 11px -apple-system,Segoe UI,Roboto,sans-serif";
+        g.textAlign = "center";
+        g.fillText("空", sl.x + sl.w / 2, sl.y + sl.h / 2);
+      }
+    }
+
+    // 待装模块
+    g.textAlign = "left";
+    g.fillStyle = "rgba(200,225,245,0.55)";
+    g.font = "700 10px -apple-system,Segoe UI,Roboto,sans-serif";
+    g.fillText("库存 " + this.modules.length, PANEL_X, GRID_TOP + 176);
+    for (var mi = 0; mi < Math.min(this.modules.length, 6); mi++) {
+      var mm = this.modules[mi];
+      g.fillStyle = G.MOD_INFO[mm].col;
+      g.globalAlpha = 0.7;
+      rr(g, PANEL_X + mi * 28, GRID_TOP + 186, 24, 24, 6);
+      g.fill();
+      g.globalAlpha = 1;
+    }
+
+    /* ===== 底栏 ===== */
+    g.fillStyle = "#08070c";
+    g.fillRect(0, H - BAR_H, W, BAR_H);
+    g.fillStyle = "rgba(190,215,240,0.55)";
+    g.font = "700 10px -apple-system,Segoe UI,Roboto,sans-serif";
+    g.textAlign = "left";
+    g.fillText("选机器 → 点格子放置 · 点已放机器移除 (" + this.placedCount + "/" + this.maxMachines + ")", 12, H - BAR_H + 22);
+
+    var rects = G.machRects();
+    for (var i2 = 0; i2 < rects.length; i2++) {
+      var r = rects[i2];
+      var on = this.selected === r.id;
+      var mdef = G.MACHINES[r.id];
+      rr(g, r.x, r.y, r.w, r.h, 10);
+      g.fillStyle = on ? mdef.col : "rgba(255,255,255,0.07)";
+      g.fill();
+      if (!on) {
+        g.strokeStyle = "rgba(140,180,220,0.22)";
+        g.lineWidth = 1;
+        rr(g, r.x, r.y, r.w, r.h, 10);
+        g.stroke();
+      }
+      g.fillStyle = on ? "#12100f" : "rgba(220,235,250,0.8)";
+      g.font = "800 11px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.textAlign = "center"; g.textBaseline = "middle";
+      g.fillText(mdef.nm, r.x + r.w / 2, r.y + 16);
+      g.font = "700 9.5px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillStyle = on ? "rgba(20,16,12,0.8)" : "rgba(200,220,240,0.5)";
+      g.fillText(G.MOD_INFO[mdef.mod].nm, r.x + r.w / 2, r.y + 32);
+    }
+  };
+
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+})(typeof window !== "undefined" ? window : globalThis);
+
+/* ==== src/main.js ==== */
+/* ForgeBuild · 启动 / 输入 / 主循环 */
+(function (root) {
+  "use strict";
+  var G = root.ForgeGame, C = G.C;
+  var W = C.W, H = C.H;
+
+  var game = null, last = 0, paused = false;
+
+  function boot() {
+    var canvas = root.document.getElementById("game");
+    game = new G.Game(canvas);
+    fit(canvas);
+    root.addEventListener("resize", function () { fit(canvas); });
+    canvas.addEventListener("pointerdown", onDown);
+    last = Date.now();
+    loop();
+  }
+
+  function fit(canvas) {
+    var vw = root.innerWidth || W, vh = root.innerHeight || H;
+    var s = Math.min(vw / W, vh / H);
+    canvas.style.width = Math.round(W * s) + "px";
+    canvas.style.height = Math.round(H * s) + "px";
+    canvas._rect = null;
+  }
+
+  function toLocal(e) {
+    var cv = root.document.getElementById("game");
+    if (!cv._rect) cv._rect = cv.getBoundingClientRect();
+    var r = cv._rect;
+    return { x: (e.clientX - r.left) / (r.width / W), y: (e.clientY - r.top) / (r.height / H) };
+  }
+
+  function onDown(e) {
+    e.preventDefault();
+    var p = toLocal(e);
+
+    // 机器按钮
+    var mr = G.machRects();
+    for (var i = 0; i < mr.length; i++) {
+      var b = mr[i];
+      if (p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h) {
+        game.selected = b.id;
+        return;
+      }
+    }
+
+    // 插槽：点一下卸下
+    var sr = G.slotRects();
+    for (var s = 0; s < sr.length; s++) {
+      var sl = sr[s];
+      if (p.x >= sl.x && p.x <= sl.x + sl.w && p.y >= sl.y && p.y <= sl.y + sl.h) {
+        if (game.equipped[sl.i]) {
+          game.modules.push(game.equipped[sl.i]);
+          game.equipped[sl.i] = null;
+        }
+        return;
+      }
+    }
+
+    // 库存：点一下装到空槽
+    if (p.x >= C.PANEL_X && p.y >= C.GRID_TOP + 186 && p.y <= C.GRID_TOP + 210) {
+      var idx = Math.floor((p.x - C.PANEL_X) / 28);
+      if (idx >= 0 && idx < game.modules.length) {
+        for (var k = 0; k < game.equipped.length; k++) {
+          if (!game.equipped[k]) { game.equipped[k] = game.modules.splice(idx, 1)[0]; return; }
+        }
+      }
+      return;
+    }
+
+    // 产线格
+    var cell = game.cellAt(p.x, p.y);
+    if (cell) game.placeMachine(cell.x, cell.y);
+  }
+
+  function loop() {
+    var now = Date.now();
+    var dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+    if (!paused) game.update(dt);
+    game.draw();
+    root.requestAnimationFrame(loop);
+  }
+
+  root.API = {
+    g: function () { return game; },
+    step: function (n, dt) {
+      dt = dt || 1 / 60;
+      for (var i = 0; i < (n || 1); i++) game.update(dt);
+      game.draw();
+      return this.info();
+    },
+    place: function (x, y, kind) {
+      if (kind) game.selected = kind;
+      return game.placeMachine(x, y);
+    },
+    info: function () {
+      return {
+        t: Math.round(game.t * 10) / 10,
+        wave: game.wave,
+        kills: game.kills,
+        leaks: game.leaks,
+        ore: game.oreQueue,
+        ores: game.ores.length,
+        modules: game.modules.length,
+        equipped: game.equipped.slice(),
+        machines: game.placedCount
+      };
+    }
+  };
+
+  if (root.document.readyState === "loading") {
+    root.document.addEventListener("DOMContentLoaded", boot);
+  } else boot();
+})(typeof window !== "undefined" ? window : globalThis);
+
+</script>
+</body>
+</html>
