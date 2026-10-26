@@ -51,6 +51,30 @@
   };
 
   var EMPTY = 0, MACH = 2, WALL = 3;
+
+  /* 局外永久升级：每局都保留，这是"增量"的来源 */
+  var META = {
+    startLv: { nm: "起手模块等级", desc: "开局所有模块直接从 LvN 开始", max: 3, cost: function (n) { return 4 + n * 5; } },
+    slots:   { nm: "产线机位",     desc: "可放置机器 +1", max: 4, cost: function (n) { return 4 + n * 5; } },
+    hp:      { nm: "城墙加固",     desc: "基地血量 +60", max: 6, cost: function (n) { return 2 + n * 3; } },
+    power:   { nm: "箭矢淬炼",     desc: "箭矢伤害 +18%", max: 12, cost: function (n) { return 2 + n * 3; } },
+    speed:   { nm: "弓术精进",     desc: "射速 +12%", max: 10, cost: function (n) { return 2 + n * 3; } }
+  };
+
+  function loadMeta() {
+    try {
+      var raw = root.localStorage && root.localStorage.getItem("forgebuild_meta");
+      if (raw) {
+        var m = JSON.parse(raw);
+        m.up = m.up || {};
+        return m;
+      }
+    } catch (e) {}
+    return { points: 0, up: {}, best: { wave: 1, kills: 0 } };
+  }
+  function saveMeta(m) {
+    try { root.localStorage && root.localStorage.setItem("forgebuild_meta", JSON.stringify(m)); } catch (e) {}
+  }
   function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
 
   function Game(canvas) {
@@ -67,8 +91,10 @@
     this.placedCount = 0;
     this.maxMachines = 6;
 
+    this.meta = loadMeta();
     this.mods = {};
     for (var k in MOD) this.mods[k] = { lv: 0, xp: 0 };
+    this.applyMeta();
     this.slots = ["double", "pierce", "rapid"];
 
     this.baseHp = 150; this.baseMaxHp = 150;
@@ -87,6 +113,41 @@
     this.gameOverT = 0;
     this.best = { wave: 1, kills: 0 };
   }
+
+  Game.prototype.applyMeta = function () {
+    var u = this.meta.up || {};
+    var startLv = u.startLv || 0;
+    for (var k in MOD) this.mods[k].lv = Math.min(startLv, MOD[k].maxLv);
+    this.maxMachines = 6 + (u.slots || 0);
+    this.baseMaxHp = 150 + (u.hp || 0) * 60;
+    this.baseHp = this.baseMaxHp;
+    this.powerMul = 1 + (u.power || 0) * 0.18;
+    this.rateBonus = 1 + (u.speed || 0) * 0.12;
+  };
+
+  Game.prototype.metaLv = function (id) { return (this.meta.up && this.meta.up[id]) || 0; };
+  Game.prototype.metaCost = function (id) { return META[id].cost(this.metaLv(id)); };
+  Game.prototype.canBuy = function (id) {
+    return this.metaLv(id) < META[id].max && this.meta.points >= this.metaCost(id);
+  };
+  Game.prototype.buyMeta = function (id) {
+    if (!this.canBuy(id)) return false;
+    this.meta.points -= this.metaCost(id);
+    this.meta.up[id] = this.metaLv(id) + 1;
+    saveMeta(this.meta);
+    return true;
+  };
+
+  /* 死亡结算：撑得越久给的越多（这是"下一局更强"的燃料） */
+  Game.prototype.awardPoints = function () {
+    var pts = Math.max(2, Math.floor(this.wave) + Math.floor(this.kills / 28));
+    this.meta.points += pts;
+    this.meta.best.wave = Math.max(this.meta.best.wave || 1, this.wave);
+    this.meta.best.kills = Math.max(this.meta.best.kills || 0, this.kills);
+    saveMeta(this.meta);
+    this.lastAward = pts;
+    return pts;
+  };
 
   Game.prototype.modLv = function (m) { return this.mods[m] ? this.mods[m].lv : 0; };
 
@@ -259,6 +320,7 @@
           this.baseHp = 0; this.dead = true;
           this.best.wave = Math.max(this.best.wave, this.wave);
           this.best.kills = Math.max(this.best.kills, this.kills);
+          this.awardPoints();
         }
         continue;
       }
@@ -269,11 +331,11 @@
     if (this.fireT <= 0) {
       var tg = this.nearest(this.archerX, this.archerY);
       if (tg) {
-        this.fireT = 0.55 / w.rateMul;
+        this.fireT = 0.55 / (w.rateMul * (this.rateBonus || 1));
         var n = w.shots;
         for (var s = 0; s < n; s++) {
           var spread = (s - (n - 1) / 2) * 18;
-          this.shootAt(tg.x, tg.y + spread, 14 + this.wave * 1.1, w.pierce);
+          this.shootAt(tg.x, tg.y + spread, (14 + this.wave * 1.1) * (this.powerMul || 1), w.pierce);
         }
       }
     }
@@ -342,7 +404,7 @@
     this.ores = []; this.oreQueue = 0; this.spawnTimer = 0; this.placedCount = 0;
     for (var k in MOD) this.mods[k] = { lv: 0, xp: 0 };
     this.slots = ["double", "pierce", "rapid"];
-    this.baseHp = this.baseMaxHp = 150;
+    this.applyMeta();          // 局外升级在每局开始时生效
     this.enemies = []; this.arrows = []; this.parts = []; this.floats = []; this.motes = [];
     this.fireT = 0; this.wave = 1; this.waveT = 0;
     this.kills = 0; this.leaks = 0; this.spawnT = 0; this.oreTotal = 0;
@@ -350,7 +412,7 @@
   };
 
   root.ForgeGame = {
-    Game: Game, MACHINES: MACHINES, MOD: MOD,
+    Game: Game, MACHINES: MACHINES, MOD: MOD, META: META,
     C: { W: W, H: H, BATTLE_H: BATTLE_H, GRID_TOP: GRID_TOP, CELL: CELL, COLS: COLS, ROWS: ROWS, GRID_X: GRID_X, PANEL_X: PANEL_X, BAR_H: BAR_H, BASE_X: BASE_X }
   };
 })(typeof window !== "undefined" ? window : globalThis);
@@ -380,6 +442,15 @@
     var w = (W - 24 - gap * (n - 1)) / n;
     return keys.map(function (k, i) { return { id: k, x: 12 + i * (w + gap), y: H - BAR_H + 40, w: w, h: 46 }; });
   };
+
+  G.metaRects = function () {
+    var ids = Object.keys(G.META);
+    return ids.map(function (k, i) {
+      return { id: k, x: 26, y: 236 + i * 54, w: W - 52, h: 46 };
+    });
+  };
+
+  G.startRect = function () { return { x: W / 2 - 84, y: H - 96, w: 168, h: 54 }; };
 
   G.modRects = function () {
     var keys = Object.keys(G.MOD);
@@ -742,32 +813,85 @@
       g.fillText(G.MOD[mdef.mod].nm, rr2.x + rr2.w / 2, rr2.y + 32);
     }
 
-    /* ===== 结算 ===== */
+    /* ===== 结算 + 局外升级 ===== */
     if (this.dead) {
-      var a2 = Math.min(1, this.gameOverT * 2.2);
-      g.fillStyle = "rgba(4,6,10," + (0.82 * a2) + ")";
+      var a2 = Math.min(1, this.gameOverT * 2.4);
+      g.fillStyle = "rgba(4,6,10," + (0.90 * a2) + ")";
       g.fillRect(0, 0, W, H);
       g.globalAlpha = a2;
       g.textAlign = "center";
+
       g.fillStyle = "#ff6b6b";
-      g.font = "800 30px -apple-system,Segoe UI,Roboto,sans-serif";
-      g.fillText("基地被攻破", W / 2, H / 2 - 90);
-      g.fillStyle = "#eaf6ff";
-      g.font = "600 15px -apple-system,Segoe UI,Roboto,sans-serif";
-      g.fillText("撑到第 " + this.wave + " 波 · 击杀 " + this.kills, W / 2, H / 2 - 46);
-      var names = [];
-      for (var kk in this.mods) {
-        if (this.mods[kk].lv > 0) names.push(G.MOD[kk].nm + " Lv" + this.mods[kk].lv);
-      }
-      g.fillStyle = "rgba(210,230,245,0.85)";
-      g.font = "600 13px -apple-system,Segoe UI,Roboto,sans-serif";
-      g.fillText(names.length ? names.join(" · ") : "没有炼出任何模块", W / 2, H / 2 - 14);
-      g.fillStyle = "rgba(255,255,255,0.55)";
+      g.font = "800 26px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText("城墙被攻破", W / 2, 52);
+      g.fillStyle = "rgba(230,245,255,0.9)";
+      g.font = "600 14px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText("第 " + this.wave + " 波 · 击杀 " + this.kills, W / 2, 78);
+
+      // 本局获得的核心
+      g.fillStyle = "rgba(255,214,120,0.95)";
+      g.font = "800 17px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText("+" + (this.lastAward || 0) + " 熔炉核心", W / 2, 108);
+      g.fillStyle = "rgba(200,225,245,0.7)";
       g.font = "600 12px -apple-system,Segoe UI,Roboto,sans-serif";
-      g.fillText("最佳：第 " + this.best.wave + " 波 · " + this.best.kills + " 杀", W / 2, H / 2 + 16);
-      g.fillStyle = "#ffd24a";
-      g.font = "800 15px -apple-system,Segoe UI,Roboto,sans-serif";
-      g.fillText("点任意处 再来一局", W / 2, H / 2 + 70);
+      g.fillText("共有 " + Math.floor(this.meta.points) + " 个 · 用来永久变强", W / 2, 128);
+
+      g.fillStyle = "rgba(255,255,255,0.55)";
+      g.font = "700 11px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText("永久升级（每局都保留）", W / 2, 158);
+
+      var mrs = G.metaRects();
+      for (var mi3 = 0; mi3 < mrs.length; mi3++) {
+        var mr = mrs[mi3];
+        var def = G.META[mr.id];
+        var lv = this.metaLv(mr.id);
+        var maxed = lv >= def.max;
+        var can = this.canBuy(mr.id);
+
+        rr(g, mr.x, mr.y, mr.w, mr.h, 10);
+        g.fillStyle = maxed ? "rgba(120,200,150,0.22)" : (can ? "rgba(90,160,230,0.30)" : "rgba(255,255,255,0.05)");
+        g.fill();
+        g.strokeStyle = maxed ? "rgba(140,220,170,0.6)" : (can ? "rgba(150,210,255,0.7)" : "rgba(140,180,220,0.18)");
+        g.lineWidth = 1.2;
+        rr(g, mr.x, mr.y, mr.w, mr.h, 10);
+        g.stroke();
+
+        g.textAlign = "left";
+        g.fillStyle = maxed ? "#a8e8c0" : (can ? "#eaf6ff" : "rgba(215,232,245,0.62)");
+        g.font = "800 12px -apple-system,Segoe UI,Roboto,sans-serif";
+        g.fillText(def.nm + "  Lv" + lv + "/" + def.max, mr.x + 12, mr.y + 17);
+        g.fillStyle = "rgba(200,222,240,0.55)";
+        g.font = "600 10px -apple-system,Segoe UI,Roboto,sans-serif";
+        g.fillText(def.desc, mr.x + 12, mr.y + 33);
+
+        g.textAlign = "right";
+        g.font = "800 13px -apple-system,Segoe UI,Roboto,sans-serif";
+        if (maxed) { g.fillStyle = "#8fe0ad"; g.fillText("MAX", mr.x + mr.w - 12, mr.y + 24); }
+        else {
+          g.fillStyle = can ? "#ffd24a" : "rgba(200,215,230,0.35)";
+          g.fillText(def.cost(lv) + " 核心", mr.x + mr.w - 12, mr.y + 24);
+        }
+      }
+
+      // 开局装备预览（让"变强"看得见）
+      g.textAlign = "center";
+      g.fillStyle = "rgba(160,215,255,0.85)";
+      g.font = "700 11px -apple-system,Segoe UI,Roboto,sans-serif";
+      var sl = this.metaLv("startLv");
+      g.fillText("下一局起手：模块 Lv" + sl + " · 机位 " + (6 + this.metaLv("slots")) +
+                 " · 城墙 " + (150 + this.metaLv("hp") * 60), W / 2, H - 118);
+
+      var sr = G.startRect();
+      var sgr = g.createLinearGradient(sr.x, sr.y, sr.x, sr.y + sr.h);
+      sgr.addColorStop(0, "#ffcf5c");
+      sgr.addColorStop(1, "#e8942a");
+      g.fillStyle = sgr;
+      rr(g, sr.x, sr.y, sr.w, sr.h, 14);
+      g.fill();
+      g.fillStyle = "#3a2408";
+      g.font = "800 17px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText("再来一局", W / 2, sr.y + sr.h / 2);
+
       g.globalAlpha = 1;
     }
   };
@@ -811,7 +935,19 @@
     e.preventDefault();
     var p = toLocal(e);
 
-    if (game.dead) { game.restart(); return; }
+    if (game.dead) {
+      var mrs = G.metaRects();
+      for (var i0 = 0; i0 < mrs.length; i0++) {
+        var mr = mrs[i0];
+        if (p.x >= mr.x && p.x <= mr.x + mr.w && p.y >= mr.y && p.y <= mr.y + mr.h) {
+          game.buyMeta(mr.id);
+          return;
+        }
+      }
+      var sr = G.startRect();
+      if (p.x >= sr.x && p.x <= sr.x + sr.w && p.y >= sr.y && p.y <= sr.y + sr.h) game.restart();
+      return;
+    }
 
     var mr = G.machRects();
     for (var i = 0; i < mr.length; i++) {
@@ -864,7 +1000,9 @@
         baseHp: Math.round(game.baseHp), dead: game.dead,
         levels: lv, slots: game.slots.slice(),
         ores: game.ores.length, queue: game.oreQueue,
-        machines: game.placedCount, arrows: game.arrows.length, enemies: game.enemies.length
+        machines: game.placedCount, arrows: game.arrows.length, enemies: game.enemies.length,
+        points: Math.floor(game.meta.points), metaUp: game.meta.up, maxMachines: game.maxMachines,
+        maxHp: game.baseMaxHp, powerMul: game.powerMul
       };
     }
   };
